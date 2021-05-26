@@ -20,7 +20,6 @@ def defineFlags():
   parser.add_argument(
       '-v', '--verbosity',
       action='store',
-      nargs=1,
       default=20,
       type=int,
       help='the logging verbosity',
