@@ -40,6 +40,39 @@ def defineFlags():
   checkFlags(parser, args)
   return args
 
+"""
+import socket,os
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    os.remove("/tmp/socketname")
+except OSError:
+    pass
+s.bind("/tmp/socketname")
+s.listen(1)
+conn, addr = s.accept()
+while 1:
+    data = conn.recv(1024)
+    if not data: break
+    conn.send(data)
+conn.close()
+
+
+# Echo client program
+import socket
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/socketname")
+s.send(b'Hello, world')
+data = s.recv(1024)
+s.close()
+print('Received ' + repr(data))
+"""
+
+"""
+echo mytext | nc -U socket.sock
+"""
+
 def isFifoFile(path):
   if not os.path.exists(path):
     return False
@@ -152,7 +185,7 @@ def main(args):
             executions += 1
             display = displayCommands(rr)
             status('Running: %s [%d]', display, executions, urgency=LOW)
-            cmd = firstCommand(rr)
+            cmd = os.path.basename(firstCommand(rr))
             shortStatus('%s..' % cmd)
             start = time.time()
             p = subprocess.Popen(['bash', '-x'], stdin=subprocess.PIPE, text=True)
@@ -194,7 +227,7 @@ def main(args):
         subprocess.call(['reset'])
         subprocess.call(['clear'])
         # print chr(27) + '[2J'
-        logging.warn('KeyboardInterrupt')
+        logging.warning('KeyboardInterrupt')
         interrupts += 1
 
   except IOError as e:
@@ -203,7 +236,7 @@ def main(args):
 
   except KeyboardInterrupt:
     print
-    logging.warn('KeyboardInterrupt')
+    logging.warning('KeyboardInterrupt')
     return os.EX_CANTCREAT
 
   finally:
