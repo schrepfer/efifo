@@ -8,10 +8,8 @@ import argparse
 import datetime
 import fcntl
 import logging
-import multiprocessing.dummy
 import os
 import queue
-import select
 import selectors
 import socket
 import stat
@@ -171,7 +169,7 @@ def bash(args: argparse.Namespace,
   """Execute this bash script.
 
   Args:
-    args: Flag arguments.
+    args: Main program args.
     script: Script to execute through `bash -x`.
     interrupt: When set, kill any running process.
   """
@@ -221,6 +219,14 @@ def bash(args: argparse.Namespace,
 
 
 def fifo_main(args: argparse.Namespace) -> int:
+  """FIFO main program takes args and returns status code.
+
+  Args:
+    args: Main program args.
+
+  Returns:
+    Status code.
+  """
   create_fifo_file(args.fifo)
   lock_file = '%s.lock' % args.fifo
   locked = False
@@ -269,6 +275,7 @@ def fifo_main(args: argparse.Namespace) -> int:
 
 
 def accept(sock: socket.socket) -> None:
+  """Accepts the socket connection."""
   conn, addr = sock.accept()
   if not addr:
     addr = conn.getsockname()
@@ -284,9 +291,9 @@ def serve(key: selectors.SelectorKey,
   """Serves the connection and adds to scripts Queue.
 
   Args:
-    key:
-    mask:
-    scripts:
+    key: The selector key.
+    mask: The selector mask.
+    scripts: The scripts queue.
 
   Returns:
     None
@@ -314,9 +321,9 @@ def dequeue(args: argparse.Namespace,
   """Dequeues events from the Queue and executes bash.
 
   Args:
-    key:
-    mask:
-    scripts:
+    key: The selector key.
+    mask: The selector mask.
+    scripts: The scripts queue.
 
   Returns:
     None
@@ -332,7 +339,7 @@ def socket_main(args: argparse.Namespace) -> int:
   """Socket main program takes args and returns status code.
 
   Args:
-    args:
+    args: Main program args.
 
   Returns:
     Status code.
@@ -360,9 +367,16 @@ def socket_main(args: argparse.Namespace) -> int:
 
   sel.register(sock, selectors.EVENT_READ, data=None)
 
+  # This event is triggered when we shut everything down.
   shutdown = threading.Event()
+
+  # This event is triggered when we want to kill the subprocess.
   interrupt = threading.Event()
+
+  # This contains all of the scripts that need to be run.
   scripts: queue.Queue[str] = queue.Queue()
+
+  # This thread watches the queue and executes the scripts.
   t = threading.Thread(target=dequeue, args=(args, scripts, interrupt, shutdown))
   t.start()
 
