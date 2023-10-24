@@ -29,10 +29,25 @@ def define_flags():
   parser.add_argument(
       '-v', '--verbosity',
       action='store',
-      default=20,
+      default=logging.INFO,
       type=int,
       help='the logging verbosity',
       metavar='LEVEL')
+  parser.add_argument(
+      '--max-interrupts',
+      action='store',
+      default=3,
+      type=int,
+      help='maximum number of interrupts before exiting',
+      metavar='COUNT')
+  parser.add_argument(
+      '--sleep-timeout',
+      action='store',
+      default=0.1,
+      type=float,
+      help='number of seconds (float) between health checks',
+      metavar='SECONDS',
+  )
   parser.add_argument(
       '-V', '--version',
       action='version',
@@ -61,40 +76,6 @@ def check_flags(parser, args):
   # See: http://docs.python.org/3/library/argparse.html#exiting-methods
   if not bool(args.fifo) ^ bool(args.socket):
     parser.error('--fifo or --socket required')
-
-
-"""
-import socket,os
-
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    os.remove("/tmp/socketname")
-except OSError:
-    pass
-s.bind("/tmp/socketname")
-s.listen(1)
-conn, addr = s.accept()
-while 1:
-    data = conn.recv(1024)
-    if not data: break
-    conn.send(data)
-conn.close()
-
-
-# Echo client program
-import socket
-
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("/tmp/socketname")
-s.send(b'Hello, world')
-data = s.recv(1024)
-s.close()
-print('Received ' + repr(data))
-"""
-
-"""
-echo mytext | nc -U socket.sock
-"""
 
 
 def is_fifo_file(path):
@@ -182,7 +163,7 @@ def display_commands(s):
 executions = 0
 
 
-def bash(script, interrupt: threading.Event = None):
+def bash(args, script, interrupt: threading.Event = None):
   global executions
   executions += 1
   display = display_commands(script)
@@ -195,6 +176,7 @@ def bash(script, interrupt: threading.Event = None):
   def poll():
     while p.poll() is None:
       if interrupt and interrupt.is_set():
+        logging.warning(f'Killing process {p}..')
         p.terminate()
         return
       status('Running: %s %ds [%d]',
@@ -202,7 +184,7 @@ def bash(script, interrupt: threading.Event = None):
               time.time() - start,
               executions,
               urgency=LOW)
-      time.sleep(0.2)
+      time.sleep(args.sleep_timeout)
 
   t = threading.Thread(target=poll)
   t.start()
@@ -247,7 +229,7 @@ def fifo_main(args):
       try:
         while True:
           with open(args.fifo, 'r') as ffh:
-            bash(ffh.read())
+            bash(args, ffh.read())
           interrupts = 0
 
       except KeyboardInterrupt:
@@ -279,7 +261,7 @@ def accept(sock: socket.socket):
   conn, addr = sock.accept()
   if not addr:
     addr = conn.getsockname()
-  logging.info(f"Accepted connection on {addr}")
+  logging.debug(f"Accepted connection on {addr}")
   conn.setblocking(False)
   data = types.SimpleNamespace(addr=addr, read=bytes(), write=bytes())
   sel.register(conn, selectors.EVENT_READ, data=data)
@@ -295,7 +277,7 @@ def serve(key: selectors.SelectorKey,
     if buf:
       data.read += buf
     else:
-      logging.info(f'Closing connection to {data.addr}')
+      logging.debug(f'Closing connection to {data.addr}')
       sel.unregister(conn)
       conn.close()
       # Execute bash now..
@@ -304,13 +286,13 @@ def serve(key: selectors.SelectorKey,
     raise NotImplemented('EVENT_WRITE is not done')
 
 
-def dequeue(scripts: queue.Queue, interrupt: threading.Event, shutdown: threading.Event):
+def dequeue(args, scripts: queue.Queue, interrupt: threading.Event, shutdown: threading.Event):
   while True:
     try:
       if shutdown.is_set():
         logging.warning('Shutdown requested.')
         break
-      bash(scripts.get(timeout=0.1), interrupt=interrupt)
+      bash(args, scripts.get(timeout=args.sleep_timeout), interrupt=interrupt)
     except queue.Empty:
       pass
 
@@ -334,17 +316,20 @@ def socket_main(args):
   sock.bind(args.socket)
   sock.listen(1)
   sock.setblocking(False)
+
+  logging.info('Listening on %s', sock.getsockname())
+
   sel.register(sock, selectors.EVENT_READ, data=None)
 
   shutdown = threading.Event()
   interrupt = threading.Event()
   scripts = queue.Queue()
-  t = threading.Thread(target=dequeue, args=(scripts, interrupt, shutdown))
+  t = threading.Thread(target=dequeue, args=(args, scripts, interrupt, shutdown))
   t.start()
 
   try:
     interrupts = 0
-    while interrupts < 3:
+    while interrupts < args.max_interrupts:
       interrupt.clear()
       try:
         events = sel.select()
@@ -364,9 +349,9 @@ def socket_main(args):
         subprocess.call(['reset'])
         subprocess.call(['clear'])
         # print chr(27) + '[2J'
-        logging.warning('KeyboardInterrupt')
-        interrupt.set()
         interrupts += 1
+        logging.warning(f'Keyboard Interrupt ({interrupts} of {args.max_interrupts})')
+        interrupt.set()
 
   except KeyboardInterrupt:
     print()
@@ -377,6 +362,7 @@ def socket_main(args):
     sel.close()
     shutdown.set()
     t.join()
+
 
 def main(args):
   if args.fifo:
