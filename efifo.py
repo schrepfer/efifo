@@ -2,6 +2,8 @@
 
 """Executes contents of FIFO file in a loop."""
 
+from typing import Generator, Any, Optional, cast
+
 import argparse
 import datetime
 import fcntl
@@ -23,7 +25,7 @@ import types
 sel = selectors.DefaultSelector()
 
 
-def define_flags():
+def define_flags() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   # See: http://docs.python.org/3/library/argparse.html
   parser.add_argument(
@@ -41,7 +43,7 @@ def define_flags():
       help='maximum number of interrupts before exiting',
       metavar='COUNT')
   parser.add_argument(
-      '--sleep-timeout',
+      '--polling-interval',
       action='store',
       default=0.1,
       type=float,
@@ -72,13 +74,13 @@ def define_flags():
   return args
 
 
-def check_flags(parser, args):
+def check_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
   # See: http://docs.python.org/3/library/argparse.html#exiting-methods
   if not bool(args.fifo) ^ bool(args.socket):
     parser.error('--fifo or --socket required')
 
 
-def is_fifo_file(path):
+def is_fifo_file(path: str) -> bool:
   if not os.path.exists(path):
     return False
   fs = os.stat(path)
@@ -87,7 +89,7 @@ def is_fifo_file(path):
   return stat.S_ISFIFO(fs.st_mode)
 
 
-def create_fifo_file(fifo_path):
+def create_fifo_file(fifo_path: str) -> None:
   if is_fifo_file(fifo_path):
     return
   fifo_dir = os.path.dirname(fifo_path)
@@ -103,7 +105,7 @@ NORMAL = 'normal'
 LOW = 'low'
 CRITICAL = 'critical'
 
-def status(msg, *args, **kwargs):
+def status(msg: str, *args: Any, **kwargs: Any) -> None:
   now = datetime.datetime.now()
   urgency = kwargs.get('urgency', NORMAL)
   category = kwargs.get('category', '')
@@ -111,7 +113,7 @@ def status(msg, *args, **kwargs):
   if os.getenv('TMUX'):
     if urgency in {CRITICAL}:
       subprocess.call(['tmux', 'display-message', ' ' + msg % args])
-  elif os.getenv('TERM').startswith('xterm'):
+  elif os.getenv('TERM', '').startswith('xterm'):
     sys.stdout.write('\x1B]0;[%s] %s: %s\x07\n' % (
         now.strftime('%H:%M:%S'),
         CMD,
@@ -124,22 +126,22 @@ def status(msg, *args, **kwargs):
                     'efifo: %s' % (msg % args)])
 
 
-def short_status(msg, *args, **kwargs):
+def short_status(msg: str, *args: Any, **kwargs: Any) -> None:
   if not os.getenv('TMUX'):
     return
-  subprocess.call(['tmux', 'rename-window', '-t', os.getenv('TMUX_PANE'), msg % args])
+  subprocess.call(['tmux', 'rename-window', '-t', os.getenv('TMUX_PANE', ''), msg % args])
 
 
 IGNORED_COMMANDS = {'cd'}
 
 
-def split_commands(s):
+def split_commands(s: str) -> Generator[str, None, None]:
   for cmds in (t.split(';') for t in s.splitlines()):
     for cmd in cmds:
       yield cmd
 
 
-def first_command(s):
+def first_command(s: str) -> str:
   for cmd in split_commands(s):
     sp = cmd.split()
     if len(sp) == 0 or sp[0] in IGNORED_COMMANDS:
@@ -148,7 +150,7 @@ def first_command(s):
   return ''
 
 
-def display_commands(s):
+def display_commands(s: str) -> str:
   ret = []
   for cmd in split_commands(s):
     sp = cmd.split()
@@ -163,7 +165,16 @@ def display_commands(s):
 executions = 0
 
 
-def bash(args, script, interrupt: threading.Event = None):
+def bash(args: argparse.Namespace,
+         script: str,
+         interrupt: Optional[threading.Event] = None) -> None:
+  """Execute this bash script.
+
+  Args:
+    args: Flag arguments.
+    script: Script to execute through `bash -x`.
+    interrupt: When set, kill any running process.
+  """
   global executions
   executions += 1
   display = display_commands(script)
@@ -173,7 +184,7 @@ def bash(args, script, interrupt: threading.Event = None):
   start = time.time()
   p = subprocess.Popen(['bash', '-x'], stdin=subprocess.PIPE, text=True)
 
-  def poll():
+  def poll() -> None:
     while p.poll() is None:
       if interrupt and interrupt.is_set():
         logging.warning(f'Killing process {p}..')
@@ -184,7 +195,7 @@ def bash(args, script, interrupt: threading.Event = None):
               time.time() - start,
               executions,
               urgency=LOW)
-      time.sleep(args.sleep_timeout)
+      time.sleep(args.polling_interval)
 
   t = threading.Thread(target=poll)
   t.start()
@@ -209,7 +220,7 @@ def bash(args, script, interrupt: threading.Event = None):
             expire='60000')
 
 
-def fifo_main(args):
+def fifo_main(args: argparse.Namespace) -> int:
   create_fifo_file(args.fifo)
   lock_file = '%s.lock' % args.fifo
   locked = False
@@ -257,7 +268,7 @@ def fifo_main(args):
   return os.EX_OK
 
 
-def accept(sock: socket.socket):
+def accept(sock: socket.socket) -> None:
   conn, addr = sock.accept()
   if not addr:
     addr = conn.getsockname()
@@ -269,8 +280,18 @@ def accept(sock: socket.socket):
 
 def serve(key: selectors.SelectorKey,
           mask: int,
-          scripts: queue.Queue):
-  conn = key.fileobj
+          scripts: queue.Queue) -> None:
+  """Serves the connection and adds to scripts Queue.
+
+  Args:
+    key:
+    mask:
+    scripts:
+
+  Returns:
+    None
+  """
+  conn = cast(socket.socket, key.fileobj)
   data = key.data
   if mask & selectors.EVENT_READ:
     buf = conn.recv(2**12)
@@ -283,21 +304,39 @@ def serve(key: selectors.SelectorKey,
       # Execute bash now..
       scripts.put(data.read.decode())
   if mask & selectors.EVENT_WRITE:
-    raise NotImplemented('EVENT_WRITE is not done')
+    raise NotImplementedError('EVENT_WRITE is not done')
 
 
-def dequeue(args, scripts: queue.Queue, interrupt: threading.Event, shutdown: threading.Event):
-  while True:
+def dequeue(args: argparse.Namespace,
+            scripts: queue.Queue,
+            interrupt: threading.Event,
+            shutdown: threading.Event) -> None:
+  """Dequeues events from the Queue and executes bash.
+
+  Args:
+    key:
+    mask:
+    scripts:
+
+  Returns:
+    None
+  """
+  while not shutdown.is_set():
     try:
-      if shutdown.is_set():
-        logging.warning('Shutdown requested.')
-        break
-      bash(args, scripts.get(timeout=args.sleep_timeout), interrupt=interrupt)
+      bash(args, scripts.get(timeout=args.polling_interval), interrupt=interrupt)
     except queue.Empty:
       pass
 
 
-def socket_main(args):
+def socket_main(args: argparse.Namespace) -> int:
+  """Socket main program takes args and returns status code.
+
+  Args:
+    args:
+
+  Returns:
+    Status code.
+  """
   if os.path.exists(args.socket):
     try:
       os.remove(args.socket)
@@ -323,7 +362,7 @@ def socket_main(args):
 
   shutdown = threading.Event()
   interrupt = threading.Event()
-  scripts = queue.Queue()
+  scripts: queue.Queue[str] = queue.Queue()
   t = threading.Thread(target=dequeue, args=(args, scripts, interrupt, shutdown))
   t.start()
 
@@ -337,7 +376,7 @@ def socket_main(args):
           # If key.data is None, then you know it’s from the listening socket.
           if key.data is None:
             #logging.info(f'accept(sock={key.fileobj})')
-            accept(key.fileobj)
+            accept(cast(socket.socket, key.fileobj))
           else:
             #logging.info(f'serve(key={key}, mask={mask})')
             serve(key, mask, scripts)
@@ -363,12 +402,15 @@ def socket_main(args):
     shutdown.set()
     t.join()
 
+  return os.EX_OK
 
-def main(args):
+
+def main(args: argparse.Namespace) -> int:
   if args.fifo:
-    fifo_main(args)
+    return fifo_main(args)
   if args.socket:
-    socket_main(args)
+    return socket_main(args)
+  return os.EX_CANTCREAT
 
 
 if __name__ == '__main__':
