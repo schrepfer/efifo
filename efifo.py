@@ -58,14 +58,16 @@ def define_flags() -> argparse.Namespace:
   parser.add_argument(
       '-V', '--version',
       action='version',
-      version='%(prog)s version 0.1')
+      version='%(prog)s version 0.1',
+  )
   parser.add_argument(
       '--socket',
       nargs='?',
       default=os.getenv('EFIFO_SOCKET', os.getenv('EFIFO')),
       type=str,
       help='socket file',
-      metavar='SOCKET')
+      metavar='SOCKET',
+  )
 
   args = parser.parse_args()
   check_flags(parser, args)
