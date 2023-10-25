@@ -2,28 +2,27 @@
 
 """Executes contents of FIFO file in a loop."""
 
-from typing import Generator, Any, Optional, cast
-
 import argparse
 import datetime
-import fcntl
 import logging
 import os
 import queue
 import selectors
 import socket
-import stat
 import subprocess
 import sys
 import threading
 import time
 import types
 
+from typing import Any, Callable, Generator, Optional, cast
+
 
 sel = selectors.DefaultSelector()
 
 
 def define_flags() -> argparse.Namespace:
+  """Defines the flags for this program."""
   parser = argparse.ArgumentParser(description=__doc__)
   # See: http://docs.python.org/3/library/argparse.html
   parser.add_argument(
@@ -32,14 +31,16 @@ def define_flags() -> argparse.Namespace:
       default=logging.INFO,
       type=int,
       help='the logging verbosity',
-      metavar='LEVEL')
+      metavar='LEVEL',
+  )
   parser.add_argument(
       '--max-interrupts',
       action='store',
       default=3,
       type=int,
       help='maximum number of interrupts before exiting',
-      metavar='COUNT')
+      metavar='COUNT',
+  )
   parser.add_argument(
       '--polling-interval',
       action='store',
@@ -49,20 +50,19 @@ def define_flags() -> argparse.Namespace:
       metavar='SECONDS',
   )
   parser.add_argument(
+      '--reset-and-clear',
+      action='store_true',
+      default=False,
+      help='reset and clear after keyboard interrupt',
+  )
+  parser.add_argument(
       '-V', '--version',
       action='version',
       version='%(prog)s version 0.1')
   parser.add_argument(
-      '--fifo',
-      nargs='?',
-      default=os.getenv('EFIFO_FIFO', os.getenv('EFIFO')),
-      type=str,
-      help='fifo file',
-      metavar='FIFO')
-  parser.add_argument(
       '--socket',
       nargs='?',
-      default=os.getenv('EFIFO_SOCKET'),
+      default=os.getenv('EFIFO_SOCKET', os.getenv('EFIFO')),
       type=str,
       help='socket file',
       metavar='SOCKET')
@@ -74,27 +74,8 @@ def define_flags() -> argparse.Namespace:
 
 def check_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
   # See: http://docs.python.org/3/library/argparse.html#exiting-methods
-  if not bool(args.fifo) ^ bool(args.socket):
-    parser.error('--fifo or --socket required')
-
-
-def is_fifo_file(path: str) -> bool:
-  if not os.path.exists(path):
-    return False
-  fs = os.stat(path)
-  if not fs:
-    return False
-  return stat.S_ISFIFO(fs.st_mode)
-
-
-def create_fifo_file(fifo_path: str) -> None:
-  if is_fifo_file(fifo_path):
-    return
-  fifo_dir = os.path.dirname(fifo_path)
-  if not os.path.isdir(fifo_dir):
-    os.makedirs(fifo_dir, 0o770)
-  if not os.path.exists(fifo_path):
-    os.mkfifo(fifo_path, 0o700)
+  if not args.socket:
+    parser.error('--socket file required')
 
 
 CMD = os.path.splitext(os.path.basename(sys.argv[0]))[0]
@@ -103,28 +84,47 @@ NORMAL = 'normal'
 LOW = 'low'
 CRITICAL = 'critical'
 
-def status(msg: str, *args: Any, **kwargs: Any) -> None:
+
+def send_notification(
+    msg: str,
+    *args: Any,
+    urgency: str = NORMAL,
+    category: str = '',
+    expire: int = 2000) -> None:
+  """Send notifications in the most visible way.
+
+  Args:
+    msg: The message to show.
+    *args: Extra string formatting files for msg.
+    urgency: One of NORMAL, LOW or CRITICAL.
+    category: A category for this notification.
+    expire: Number of seconds to expire.
+  """
   now = datetime.datetime.now()
-  urgency = kwargs.get('urgency', NORMAL)
-  category = kwargs.get('category', '')
-  expire = kwargs.get('expire', '2000')
   if os.getenv('TMUX'):
     if urgency in {CRITICAL}:
       subprocess.call(['tmux', 'display-message', ' ' + msg % args])
   elif os.getenv('TERM', '').startswith('xterm'):
-    sys.stdout.write('\x1B]0;[%s] %s: %s\x07\n' % (
-        now.strftime('%H:%M:%S'),
-        CMD,
-        msg % args))
+    sys.stdout.write('\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
+        time=now.strftime('%H:%M:%S'),
+        cmd=CMD,
+        message=msg % args,
+    ))
   if urgency in {NORMAL, CRITICAL}:
     subprocess.call(['notify-send',
-                    "-u", urgency,
-                    '-c', category,
-                    '-t', expire,
-                    'efifo: %s' % (msg % args)])
+                     '-u', urgency,
+                     '-c', category,
+                     '-t', str(expire),
+                     'efifo: %s' % (msg % args)])
 
 
-def short_status(msg: str, *args: Any, **kwargs: Any) -> None:
+def short_status(msg: str, *args: Any) -> None:
+  """Display a short status message (to TMUX).
+
+  Args:
+    msg: The message to show.
+    *args: Extra string formatting files for msg.
+  """
   if not os.getenv('TMUX'):
     return
   subprocess.call(['tmux', 'rename-window', '-t', os.getenv('TMUX_PANE', ''), msg % args])
@@ -142,7 +142,7 @@ def split_commands(s: str) -> Generator[str, None, None]:
 def first_command(s: str) -> str:
   for cmd in split_commands(s):
     sp = cmd.split()
-    if len(sp) == 0 or sp[0] in IGNORED_COMMANDS:
+    if not sp or sp[0] in IGNORED_COMMANDS:
       continue
     return sp[0]
   return ''
@@ -152,7 +152,7 @@ def display_commands(s: str) -> str:
   ret = []
   for cmd in split_commands(s):
     sp = cmd.split()
-    if len(sp) == 0 or sp[0] in IGNORED_COMMANDS:
+    if not sp or sp[0] in IGNORED_COMMANDS:
       continue
     ret.append(cmd.strip())
   if not ret:
@@ -163,36 +163,41 @@ def display_commands(s: str) -> str:
 executions = 0
 
 
-def bash(args: argparse.Namespace,
-         script: str,
-         interrupt: Optional[threading.Event] = None) -> None:
+def execute_bash(args: argparse.Namespace,
+                 script: str,
+                 interrupt: Optional[threading.Event] = None) -> Optional[int]:
   """Execute this bash script.
 
   Args:
     args: Main program args.
     script: Script to execute through `bash -x`.
     interrupt: When set, kill any running process.
+
+  Returns:
+    Status code.
   """
   global executions
   executions += 1
   display = display_commands(script)
-  status('Running: %s [%d]', display, executions, urgency=LOW)
+  send_notification('Running: %s [%d]', display, executions, urgency=LOW)
   cmd = os.path.basename(first_command(script))
   short_status('%s..' % cmd)
   start = time.time()
   p = subprocess.Popen(['bash', '-x'], stdin=subprocess.PIPE, text=True)
+  proc = types.SimpleNamespace(killed=False)
 
   def poll() -> None:
     while p.poll() is None:
       if interrupt and interrupt.is_set():
         logging.warning(f'Killing process {p}..')
         p.terminate()
+        proc.killed = True
         return
-      status('Running: %s %ds [%d]',
-              display,
-              time.time() - start,
-              executions,
-              urgency=LOW)
+      send_notification('Running: %s %ds [%d]',
+                        display,
+                        time.time() - start,
+                        executions,
+                        urgency=LOW)
       time.sleep(args.polling_interval)
 
   t = threading.Thread(target=poll)
@@ -202,84 +207,46 @@ def bash(args: argparse.Namespace,
   elapsed = time.time() - start
   t.join()
 
+  if proc.killed:
+    short_status(cmd)
+    send_notification('KILLED: %s %0.2fs',
+                      display,
+                      elapsed,
+                      category='done',
+                      expire=15000,
+                      urgency=NORMAL)
+    return None
+
   if p.returncode == 0:
     short_status(cmd)
-    status('DONE: %s [%d] %0.2fs',
-            display, p.returncode, elapsed,
-            category='done',
-            expire='15000',
-            urgency=NORMAL)
+    send_notification('DONE: %s [%d] %0.2fs',
+                      display,
+                      p.returncode,
+                      elapsed,
+                      category='done',
+                      expire=15000,
+                      urgency=NORMAL)
   else:
     short_status('%s!' % cmd)
-    status('FAILED: %s [%d] %0.2fs',
-            display, p.returncode, elapsed,
-            category='failed',
-            urgency=CRITICAL,
-            expire='60000')
+    send_notification('FAILED: %s [%d] %0.2fs',
+                      display,
+                      p.returncode,
+                      elapsed,
+                      category='failed',
+                      urgency=CRITICAL,
+                      expire=60000)
 
-
-def fifo_main(args: argparse.Namespace) -> int:
-  """FIFO main program takes args and returns status code.
-
-  Args:
-    args: Main program args.
-
-  Returns:
-    Status code.
-  """
-  create_fifo_file(args.fifo)
-  lock_file = '%s.lock' % args.fifo
-  locked = False
-  try:
-    logging.info('Acquiring lock file: %s', lock_file)
-    fh = open(lock_file, 'w')
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    logging.info('Lock acquire succeeded: %s', lock_file)
-
-    locked = True
-    interrupts = 0
-
-    status('Waiting', category='waiting', urgency=LOW)
-    short_status('x')
-
-    while interrupts < 3:
-      try:
-        while True:
-          with open(args.fifo, 'r') as ffh:
-            bash(args, ffh.read())
-          interrupts = 0
-
-      except KeyboardInterrupt:
-        status('Keyboard Interrupt', category='interrupt', urgency=LOW)
-        subprocess.call(['reset'])
-        subprocess.call(['clear'])
-        # print chr(27) + '[2J'
-        logging.warning('KeyboardInterrupt')
-        interrupts += 1
-
-  except IOError as e:
-    logging.error(e)
-    return os.EX_UNAVAILABLE
-
-  except KeyboardInterrupt:
-    print
-    logging.warning('KeyboardInterrupt')
-    return os.EX_CANTCREAT
-
-  finally:
-    if locked:
-      fcntl.flock(fh, fcntl.LOCK_UN)
-      logging.info('Lock released: %s', lock_file)
-
-  return os.EX_OK
+  return p.returncode
 
 
 def accept(sock: socket.socket) -> None:
   """Accepts the socket connection."""
   conn, addr = sock.accept()
+  # If this is a socket file the addr is going to be empty. Let's use the
+  # filename instead to have something to print.
   if not addr:
     addr = conn.getsockname()
-  logging.debug(f"Accepted connection on {addr}")
+  logging.debug(f'Accepted connection on {addr}')
   conn.setblocking(False)
   data = types.SimpleNamespace(addr=addr, read=bytes(), write=bytes())
   sel.register(conn, selectors.EVENT_READ, data=data)
@@ -287,16 +254,13 @@ def accept(sock: socket.socket) -> None:
 
 def serve(key: selectors.SelectorKey,
           mask: int,
-          scripts: queue.Queue) -> None:
+          scripts: queue.Queue[str]) -> None:
   """Serves the connection and adds to scripts Queue.
 
   Args:
     key: The selector key.
     mask: The selector mask.
     scripts: The scripts queue.
-
-  Returns:
-    None
   """
   conn = cast(socket.socket, key.fileobj)
   data = key.data
@@ -308,35 +272,36 @@ def serve(key: selectors.SelectorKey,
       logging.debug(f'Closing connection to {data.addr}')
       sel.unregister(conn)
       conn.close()
-      # Execute bash now..
+      # Scripts contains the various scripts to be executed.
       scripts.put(data.read.decode())
   if mask & selectors.EVENT_WRITE:
-    raise NotImplementedError('EVENT_WRITE is not done')
+    raise NotImplementedError('EVENT_WRITE is not written')
 
 
 def dequeue(args: argparse.Namespace,
-            scripts: queue.Queue,
+            scripts: queue.Queue[str],
             interrupt: threading.Event,
-            shutdown: threading.Event) -> None:
+            shutdown: threading.Event,
+            callback: Callable[[Optional[int]], None]) -> None:
   """Dequeues events from the Queue and executes bash.
 
   Args:
-    key: The selector key.
-    mask: The selector mask.
+    args: Main program args.
     scripts: The scripts queue.
-
-  Returns:
-    None
+    interrupt: When set, kill any running process.
+    shutdown: When set, shutdown this thread.
+    callback: Callback function that takes the command status code as input.
   """
   while not shutdown.is_set():
     try:
-      bash(args, scripts.get(timeout=args.polling_interval), interrupt=interrupt)
+      retcode = execute_bash(args, scripts.get(timeout=args.polling_interval), interrupt=interrupt)
+      callback(retcode)
     except queue.Empty:
       pass
 
 
-def socket_main(args: argparse.Namespace) -> int:
-  """Socket main program takes args and returns status code.
+def main(args: argparse.Namespace) -> int:
+  """Main program takes args and returns status code.
 
   Args:
     args: Main program args.
@@ -355,7 +320,7 @@ def socket_main(args: argparse.Namespace) -> int:
     if not os.path.isdir(dirname):
       os.makedirs(dirname, 0o770)
 
-  status('Waiting', category='waiting', urgency=LOW)
+  send_notification('Waiting', category='waiting', urgency=LOW)
   short_status('x')
 
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -376,34 +341,43 @@ def socket_main(args: argparse.Namespace) -> int:
   # This contains all of the scripts that need to be run.
   scripts: queue.Queue[str] = queue.Queue()
 
+  proc = types.SimpleNamespace(interrupts=0)
+
+  def reset_interrupts(retcode: Optional[int]):
+    if retcode is not None:
+      logging.debug('interrupts reset to 0')
+      proc.interrupts = 0
+
   # This thread watches the queue and executes the scripts.
-  t = threading.Thread(target=dequeue, args=(args, scripts, interrupt, shutdown))
+  t = threading.Thread(target=dequeue, args=(
+      args,
+      scripts,
+      interrupt,
+      shutdown,
+      reset_interrupts,
+  ))
   t.start()
 
   try:
-    interrupts = 0
-    while interrupts < args.max_interrupts:
+    while proc.interrupts < args.max_interrupts:
       interrupt.clear()
       try:
         events = sel.select()
         for key, mask in events:
           # If key.data is None, then you know it’s from the listening socket.
           if key.data is None:
-            #logging.info(f'accept(sock={key.fileobj})')
             accept(cast(socket.socket, key.fileobj))
           else:
-            #logging.info(f'serve(key={key}, mask={mask})')
             serve(key, mask, scripts)
-        # This should go in the Thread instead.
-        interrupts = 0
 
       except KeyboardInterrupt:
-        status('Keyboard Interrupt', category='interrupt', urgency=LOW)
-        subprocess.call(['reset'])
-        subprocess.call(['clear'])
+        send_notification('Keyboard Interrupt', category='interrupt', urgency=LOW)
+        if args.reset_and_clear:
+          subprocess.call(['reset'])
+          subprocess.call(['clear'])
         # print chr(27) + '[2J'
-        interrupts += 1
-        logging.warning(f'Keyboard Interrupt ({interrupts} of {args.max_interrupts})')
+        proc.interrupts += 1
+        logging.warning(f'Keyboard Interrupt ({proc.interrupts} of {args.max_interrupts})')
         interrupt.set()
 
   except KeyboardInterrupt:
@@ -419,18 +393,10 @@ def socket_main(args: argparse.Namespace) -> int:
   return os.EX_OK
 
 
-def main(args: argparse.Namespace) -> int:
-  if args.fifo:
-    return fifo_main(args)
-  if args.socket:
-    return socket_main(args)
-  return os.EX_CANTCREAT
-
-
 if __name__ == '__main__':
-  args = define_flags()
+  a = define_flags()
   logging.basicConfig(
-      level=args.verbosity,
+      level=a.verbosity,
       datefmt='%Y/%m/%d %H:%M:%S',
       format='[%(asctime)s] %(levelname)s: %(message)s')
-  sys.exit(main(args))
+  sys.exit(main(a))
