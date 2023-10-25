@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Executes contents of FIFO file in a loop."""
+"""Executes arbitrary scripts passed in via TCP socket."""
 
 import argparse
 import datetime
