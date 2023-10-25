@@ -118,8 +118,8 @@ def send_notification(
                      'efifo: %s' % (msg % args)])
 
 
-def short_status(msg: str, *args: Any) -> None:
-  """Display a short status message (to TMUX).
+def rename_tab(msg: str, *args: Any) -> None:
+  """Renames the tab executing this program.
 
   Args:
     msg: The message to show.
@@ -181,7 +181,7 @@ def execute_bash(args: argparse.Namespace,
   display = display_commands(script)
   send_notification('Running: %s [%d]', display, executions, urgency=LOW)
   cmd = os.path.basename(first_command(script))
-  short_status('%s..' % cmd)
+  rename_tab('%s..' % cmd)
   start = time.time()
   p = subprocess.Popen(['bash', '-x'], stdin=subprocess.PIPE, text=True)
   proc = types.SimpleNamespace(killed=False)
@@ -208,7 +208,7 @@ def execute_bash(args: argparse.Namespace,
   t.join()
 
   if proc.killed:
-    short_status(cmd)
+    rename_tab(cmd)
     send_notification('KILLED: %s %0.2fs',
                       display,
                       elapsed,
@@ -218,7 +218,7 @@ def execute_bash(args: argparse.Namespace,
     return None
 
   if p.returncode == 0:
-    short_status(cmd)
+    rename_tab(cmd)
     send_notification('DONE: %s [%d] %0.2fs',
                       display,
                       p.returncode,
@@ -227,7 +227,7 @@ def execute_bash(args: argparse.Namespace,
                       expire=15000,
                       urgency=NORMAL)
   else:
-    short_status('%s!' % cmd)
+    rename_tab('%s!' % cmd)
     send_notification('FAILED: %s [%d] %0.2fs',
                       display,
                       p.returncode,
@@ -321,7 +321,7 @@ def main(args: argparse.Namespace) -> int:
       os.makedirs(dirname, 0o770)
 
   send_notification('Waiting', category='waiting', urgency=LOW)
-  short_status('x')
+  rename_tab('x')
 
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
   sock.bind(args.socket)
