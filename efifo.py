@@ -109,7 +109,7 @@ class Notification(object):
   def send(self, args: argparse.Namespace) -> None:
     """Send notifications in the most visible way."""
     if os.getenv('TMUX'):
-      if urgency in {CRITICAL}:
+      if self.urgency in {CRITICAL}:
         subprocess.call(['tmux', 'display-message', ' ' + self.message])
     elif os.getenv('TERM', '').startswith('xterm'):
       sys.stdout.write(
@@ -120,7 +120,7 @@ class Notification(object):
           )
       )
     if not args.headless:
-      if urgency in {NORMAL, CRITICAL}:
+      if self.urgency in {NORMAL, CRITICAL}:
         # Use Popen to not wait for it
         subprocess.call([
             'notify-send',
