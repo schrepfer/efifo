@@ -14,8 +14,7 @@ import sys
 import threading
 import time
 import types
-
-from typing import Any, Callable, Generator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, cast
 
 
 sel = selectors.DefaultSelector()
@@ -26,7 +25,8 @@ def define_flags() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   # See: http://docs.python.org/3/library/argparse.html
   parser.add_argument(
-      '-v', '--verbosity',
+      '-v',
+      '--verbosity',
       action='store',
       default=logging.INFO,
       type=int,
@@ -40,6 +40,13 @@ def define_flags() -> argparse.Namespace:
       type=int,
       help='maximum number of interrupts before exiting',
       metavar='COUNT',
+  )
+  parser.add_argument(
+      '-x',
+      '--headless',
+      action='store_true',
+      default=False,
+      help="if the machine is headless then notify-send isn't used",
   )
   parser.add_argument(
       '--polling-interval',
@@ -56,7 +63,8 @@ def define_flags() -> argparse.Namespace:
       help='reset and clear after keyboard interrupt',
   )
   parser.add_argument(
-      '-V', '--version',
+      '-V',
+      '--version',
       action='version',
       version='%(prog)s version 0.1',
   )
@@ -74,7 +82,9 @@ def define_flags() -> argparse.Namespace:
   return args
 
 
-def check_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def check_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
   # See: http://docs.python.org/3/library/argparse.html#exiting-methods
   if not args.socket:
     parser.error('--socket file required')
@@ -87,17 +97,109 @@ LOW = 'low'
 CRITICAL = 'critical'
 
 
+class Notification(object):
+
+  def __init__(self, message, urgency, category, expire, t):
+    self.message = message
+    self.urgency = urgency
+    self.category = category
+    self.expire = expire
+    self.time = t
+
+  def send(self, args: argparse.Namespace) -> None:
+    """Send notifications in the most visible way."""
+    if os.getenv('TMUX'):
+      if urgency in {CRITICAL}:
+        subprocess.call(['tmux', 'display-message', ' ' + self.message])
+    elif os.getenv('TERM', '').startswith('xterm'):
+      sys.stdout.write(
+          '\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
+              time=self.time.strftime('%H:%M:%S'),
+              cmd=CMD,
+              message=self.message,
+          )
+      )
+    if not args.headless:
+      if urgency in {NORMAL, CRITICAL}:
+        # Use Popen to not wait for it
+        subprocess.call([
+            'notify-send',
+            '-u',
+            self.urgency,
+            '-c',
+            self.category,
+            '-t',
+            str(self.expire),
+            'efifo: %s' % self.message,
+        ])
+
+
+class NotificationManager(object):
+  """Manages notifications."""
+
+  args: argparse.Namespace
+  t: threading.Thread
+  interrupt: threading.Event
+  shutdown: threading.Event
+  queue: queue.Queue[Notification]
+
+  def __init__(self, args: argparse.Namespace):
+    self.args = args
+    self.t = threading.Thread(target=self.dequeue)
+    self.interrupt = threading.Event()
+    self.shutdown = threading.Event()
+    self.queue = queue.Queue()
+
+  def start(self):
+    self.t.start()
+
+  def enqueue(
+      self,
+      msg: str,
+      *format_args: Any,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+  ) -> None:
+    self.queue.put(
+        Notification(
+            message=msg % format_args,
+            urgency=urgency,
+            category=category,
+            expire=expire,
+            t=datetime.datetime.now(),
+        )
+    )
+
+  def dequeue(self):
+    while not self.shutdown.is_set():
+      try:
+        n = queue.get(timeout=self.args.polling_interval)
+        send_notification(
+            self.args,
+            n.message,
+            urgency=n.urgency,
+            category=n.category,
+            expire=n.expire,
+        )
+      except queue.Empty:
+        pass
+
+
 def send_notification(
+    args: argparse.Namespace,
     msg: str,
-    *args: Any,
+    *format_args: Any,
     urgency: str = NORMAL,
     category: str = '',
-    expire: int = 2000) -> None:
+    expire: int = 2000,
+) -> None:
   """Send notifications in the most visible way.
 
   Args:
+    args: Main program args.
     msg: The message to show.
-    *args: Extra string formatting files for msg.
+    *format_args: Extra string formatting files for msg.
     urgency: One of NORMAL, LOW or CRITICAL.
     category: A category for this notification.
     expire: Number of seconds to expire.
@@ -105,19 +207,28 @@ def send_notification(
   now = datetime.datetime.now()
   if os.getenv('TMUX'):
     if urgency in {CRITICAL}:
-      subprocess.call(['tmux', 'display-message', ' ' + msg % args])
+      subprocess.call(['tmux', 'display-message', ' ' + msg % format_args])
   elif os.getenv('TERM', '').startswith('xterm'):
-    sys.stdout.write('\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
-        time=now.strftime('%H:%M:%S'),
-        cmd=CMD,
-        message=msg % args,
-    ))
-  if urgency in {NORMAL, CRITICAL}:
-    subprocess.call(['notify-send',
-                     '-u', urgency,
-                     '-c', category,
-                     '-t', str(expire),
-                     'efifo: %s' % (msg % args)])
+    sys.stdout.write(
+        '\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
+            time=now.strftime('%H:%M:%S'),
+            cmd=CMD,
+            message=msg % format_args,
+        )
+    )
+  if not args.headless:
+    if urgency in {NORMAL, CRITICAL}:
+      # Use Popen to not wait for it
+      subprocess.Popen([
+          'notify-send',
+          '-u',
+          urgency,
+          '-c',
+          category,
+          '-t',
+          str(expire),
+          'efifo: %s' % (msg % format_args),
+      ])
 
 
 def rename_tab(msg: str, *args: Any) -> None:
@@ -129,13 +240,15 @@ def rename_tab(msg: str, *args: Any) -> None:
   """
   if not os.getenv('TMUX'):
     return
-  subprocess.call(['tmux', 'rename-window', '-t', os.getenv('TMUX_PANE', ''), msg % args])
+  subprocess.call(
+      ['tmux', 'rename-window', '-t', os.getenv('TMUX_PANE', ''), msg % args]
+  )
 
 
 IGNORED_COMMANDS = {'cd'}
 
 
-def split_commands(s: str) -> Generator[str, None, None]:
+def split_commands(s: str) -> Iterator[str]:
   for cmds in (t.split(';') for t in s.splitlines()):
     for cmd in cmds:
       yield cmd
@@ -163,11 +276,13 @@ def display_commands(s: str) -> str:
 
 
 executions = 0
+last_script: Optional[str] = None
 
-
-def execute_bash(args: argparse.Namespace,
-                 script: str,
-                 interrupt: Optional[threading.Event] = None) -> Optional[int]:
+def execute_bash(
+    args: argparse.Namespace,
+    script: str,
+    interrupt: Optional[threading.Event] = None,
+) -> Optional[int]:
   """Execute this bash script.
 
   Args:
@@ -181,7 +296,7 @@ def execute_bash(args: argparse.Namespace,
   global executions
   executions += 1
   display = display_commands(script)
-  send_notification('Running: %s [%d]', display, executions, urgency=LOW)
+  send_notification(args, 'Running: %s [%d]', display, executions, urgency=LOW)
   cmd = os.path.basename(first_command(script))
   rename_tab('%s..' % cmd)
   start = time.time()
@@ -195,11 +310,14 @@ def execute_bash(args: argparse.Namespace,
         p.terminate()
         proc.killed = True
         return
-      send_notification('Running: %s %ds [%d]',
-                        display,
-                        time.time() - start,
-                        executions,
-                        urgency=LOW)
+      send_notification(
+          args,
+          'Running: %s %ds [%d]',
+          display,
+          time.time() - start,
+          executions,
+          urgency=LOW,
+      )
       time.sleep(args.polling_interval)
 
   t = threading.Thread(target=poll)
@@ -211,32 +329,41 @@ def execute_bash(args: argparse.Namespace,
 
   if proc.killed:
     rename_tab(cmd)
-    send_notification('KILLED: %s %0.2fs',
-                      display,
-                      elapsed,
-                      category='done',
-                      expire=15000,
-                      urgency=NORMAL)
+    send_notification(
+        args,
+        'KILLED: %s %0.2fs',
+        display,
+        elapsed,
+        category='done',
+        expire=15000,
+        urgency=NORMAL,
+    )
     return None
 
   if p.returncode == 0:
     rename_tab(cmd)
-    send_notification('DONE: %s [%d] %0.2fs',
-                      display,
-                      p.returncode,
-                      elapsed,
-                      category='done',
-                      expire=15000,
-                      urgency=NORMAL)
+    send_notification(
+        args,
+        'DONE: %s [%d] %0.2fs',
+        display,
+        p.returncode,
+        elapsed,
+        category='done',
+        expire=15000,
+        urgency=NORMAL,
+    )
   else:
     rename_tab('%s!' % cmd)
-    send_notification('FAILED: %s [%d] %0.2fs',
-                      display,
-                      p.returncode,
-                      elapsed,
-                      category='failed',
-                      urgency=CRITICAL,
-                      expire=60000)
+    send_notification(
+        args,
+        'FAILED: %s [%d] %0.2fs',
+        display,
+        p.returncode,
+        elapsed,
+        category='failed',
+        urgency=CRITICAL,
+        expire=60000,
+    )
 
   return p.returncode
 
@@ -254,9 +381,9 @@ def accept(sock: socket.socket) -> None:
   sel.register(conn, selectors.EVENT_READ, data=data)
 
 
-def serve(key: selectors.SelectorKey,
-          mask: int,
-          scripts: queue.Queue[str]) -> None:
+def serve(
+    key: selectors.SelectorKey, mask: int, scripts: queue.Queue[str]
+) -> None:
   """Serves the connection and adds to scripts Queue.
 
   Args:
@@ -280,11 +407,13 @@ def serve(key: selectors.SelectorKey,
     raise NotImplementedError('EVENT_WRITE is not written')
 
 
-def dequeue(args: argparse.Namespace,
-            scripts: queue.Queue[str],
-            interrupt: threading.Event,
-            shutdown: threading.Event,
-            callback: Callable[[Optional[int]], None]) -> None:
+def dequeue(
+    args: argparse.Namespace,
+    scripts: queue.Queue[str],
+    interrupt: threading.Event,
+    shutdown: threading.Event,
+    callback: Callable[[Optional[int]], None],
+) -> None:
   """Dequeues events from the Queue and executes bash.
 
   Args:
@@ -294,12 +423,25 @@ def dequeue(args: argparse.Namespace,
     shutdown: When set, shutdown this thread.
     callback: Callback function that takes the command status code as input.
   """
+  global last_script
   while not shutdown.is_set():
     try:
-      retcode = execute_bash(args, scripts.get(timeout=args.polling_interval), interrupt=interrupt)
+      script = scripts.get(timeout=args.polling_interval)
+      last_script = script
+      retcode = execute_bash(args, script, interrupt=interrupt)
       callback(retcode)
     except queue.Empty:
       pass
+
+
+def remove_socket_file(args: argparse.Namespace) -> Optional[int]:
+  if os.path.exists(args.socket):
+    try:
+      os.remove(args.socket)
+    except OSError as e:
+      logging.error(e)
+      return os.EX_UNAVAILABLE
+  return None
 
 
 def main(args: argparse.Namespace) -> int:
@@ -312,18 +454,18 @@ def main(args: argparse.Namespace) -> int:
     Status code.
   """
   if os.path.exists(args.socket):
-    try:
-      os.remove(args.socket)
-    except OSError as e:
-      logging.error(e)
-      return os.EX_UNAVAILABLE
+    ret = remove_socket_file(args)
+    if ret is not None:
+      return ret
   else:
     dirname = os.path.dirname(args.socket)
     if not os.path.isdir(dirname):
       os.makedirs(dirname, 0o770)
 
-  send_notification('Waiting', category='waiting', urgency=LOW)
+  send_notification(args, 'Waiting', category='waiting', urgency=LOW)
   rename_tab('x')
+
+  sel.register(sys.stdin, selectors.EVENT_READ, data=None)
 
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
   sock.bind(args.socket)
@@ -351,13 +493,16 @@ def main(args: argparse.Namespace) -> int:
       proc.interrupts = 0
 
   # This thread watches the queue and executes the scripts.
-  t = threading.Thread(target=dequeue, args=(
-      args,
-      scripts,
-      interrupt,
-      shutdown,
-      reset_interrupts,
-  ))
+  t = threading.Thread(
+      target=dequeue,
+      args=(
+          args,
+          scripts,
+          interrupt,
+          shutdown,
+          reset_interrupts,
+      ),
+  )
   t.start()
 
   try:
@@ -366,20 +511,30 @@ def main(args: argparse.Namespace) -> int:
       try:
         events = sel.select()
         for key, mask in events:
-          # If key.data is None, then you know it’s from the listening socket.
-          if key.data is None:
-            accept(cast(socket.socket, key.fileobj))
-          else:
-            serve(key, mask, scripts)
+          if key.fileobj == sys.stdin:
+            sys.stdin.readline()
+            if last_script:
+              logging.info('Running last script again..')
+              scripts.put(last_script)
+          elif isinstance(key.fileobj, socket.socket):
+            # If key.data is None, then you know it’s from the listening socket.
+            if key.data is None:
+              accept(key.fileobj)
+            else:
+              serve(key, mask, scripts)
 
       except KeyboardInterrupt:
-        send_notification('Keyboard Interrupt', category='interrupt', urgency=LOW)
+        send_notification(
+            args, 'Keyboard Interrupt', category='interrupt', urgency=LOW
+        )
         if args.reset_and_clear:
           subprocess.call(['reset'])
           subprocess.call(['clear'])
         # print chr(27) + '[2J'
         proc.interrupts += 1
-        logging.warning(f'Keyboard Interrupt ({proc.interrupts} of {args.max_interrupts})')
+        logging.warning(
+            f'Keyboard Interrupt ({proc.interrupts} of {args.max_interrupts})'
+        )
         interrupt.set()
 
   except KeyboardInterrupt:
@@ -391,6 +546,7 @@ def main(args: argparse.Namespace) -> int:
     sel.close()
     shutdown.set()
     t.join()
+    remove_socket_file(args)
 
   return os.EX_OK
 
@@ -400,5 +556,6 @@ if __name__ == '__main__':
   logging.basicConfig(
       level=a.verbosity,
       datefmt='%Y/%m/%d %H:%M:%S',
-      format='[%(asctime)s] %(levelname)s: %(message)s')
+      format='[%(asctime)s] %(levelname)s: %(message)s',
+  )
   sys.exit(main(a))
