@@ -2,22 +2,260 @@
 
 """Executes arbitrary scripts passed in via TCP socket."""
 
+import abc
 import argparse
+from collections.abc import Iterator, Sequence
 import datetime
 import logging
 import os
 import queue
 import selectors
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
 import types
-from typing import Any, Callable, Iterator, Optional, cast
+from typing import Any, Callable, Optional, cast
+import urllib.parse
 
 
 sel = selectors.DefaultSelector()
+
+CMD = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+
+NORMAL = 'normal'
+LOW = 'low'
+CRITICAL = 'critical'
+
+
+class Notifier(abc.ABC):
+  """Shared interface for downstream notification methods."""
+
+  name: str = ''
+  binary_name: Optional[str] = None
+  fallback_binary: Optional[str] = None
+
+  def __init__(self, args: argparse.Namespace) -> None:
+    self.args = args
+    self.binary = self._resolve_binary()
+
+  def _resolve_binary(self) -> Optional[str]:
+    if not self.binary_name and not self.fallback_binary:
+      return None
+    if self.binary_name:
+      found = shutil.which(self.binary_name)
+      if found:
+        return found
+    if (
+        self.fallback_binary
+        and os.path.isfile(self.fallback_binary)
+        and os.access(self.fallback_binary, os.X_OK)
+    ):
+      return self.fallback_binary
+    return None
+
+  def _spawn(self, cmd: Sequence[str]) -> None:
+    try:
+      subprocess.Popen(
+          cmd,
+          stdin=subprocess.DEVNULL,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+      )
+    except OSError as e:
+      logging.debug('Failed to execute %s: %s', self.name, e)
+
+  @abc.abstractmethod
+  def is_available(self) -> bool:
+    """Returns True if this notification method can be used."""
+
+  @abc.abstractmethod
+  def send(
+      self,
+      message: str,
+      *,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+      now: Optional[datetime.datetime] = None,
+  ) -> None:
+    """Sends a notification."""
+
+
+class TmuxNotifier(Notifier):
+  """Sends critical notifications via tmux display-message."""
+
+  name = 'tmux'
+  binary_name = 'tmux'
+  fallback_binary = '/usr/bin/tmux'
+
+  def is_available(self) -> bool:
+    return bool(os.getenv('TMUX')) and self.binary is not None
+
+  def send(
+      self,
+      message: str,
+      *,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+      now: Optional[datetime.datetime] = None,
+  ) -> None:
+    del category, expire, now
+    if urgency not in {CRITICAL} or not self.binary:
+      return
+    self._spawn([self.binary, 'display-message', ' ' + message])
+
+
+class XtermNotifier(Notifier):
+  """Updates the xterm window title via OSC escape sequence."""
+
+  name = 'xterm'
+
+  def is_available(self) -> bool:
+    return not os.getenv('TMUX') and os.getenv('TERM', '').startswith('xterm')
+
+  def send(
+      self,
+      message: str,
+      *,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+      now: Optional[datetime.datetime] = None,
+  ) -> None:
+    del urgency, category, expire
+    ts = (now or datetime.datetime.now()).strftime('%H:%M:%S')
+    sys.stdout.write(f'\x1B]0;[{ts}] {CMD}: {message}\x07\n')
+    sys.stdout.flush()
+
+
+class NotifySendNotifier(Notifier):
+  """Sends desktop notifications via /usr/bin/notify-send."""
+
+  name = 'notify-send'
+  binary_name = 'notify-send'
+  fallback_binary = '/usr/bin/notify-send'
+
+  def is_available(self) -> bool:
+    return (
+        not getattr(self.args, 'headless', False) and self.binary is not None
+    )
+
+  def send(
+      self,
+      message: str,
+      *,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+      now: Optional[datetime.datetime] = None,
+  ) -> None:
+    del now
+    if urgency not in {NORMAL, CRITICAL} or not self.binary:
+      return
+    cmd = [
+        self.binary,
+        '-u',
+        urgency,
+        '-t',
+        str(expire),
+    ]
+    if category:
+      cmd.extend(['-c', category])
+    cmd.append(f'{CMD}: {message}')
+    self._spawn(cmd)
+
+
+class NotifySelfNotifier(Notifier):
+  """Sends G3N notifications via notify_self."""
+
+  name = 'notify-self'
+  binary_name = 'notify_self'
+  fallback_binary = '/google/bin/releases/g3n-team/notify_self'
+
+  def __init__(self, args: argparse.Namespace) -> None:
+    super().__init__(args)
+    host = socket.gethostname().split('.')[0]
+    session = os.getenv('TMUX_SESSION')
+    self.summary = (
+        f'{CMD} ({session}) on {host}' if session else f'{CMD} on {host}'
+    )
+    target = session or args.socket
+    self.uri = (
+        'http://go/g3n-self?'
+        f'host={urllib.parse.quote(host, safe="")}'
+        f'&session={urllib.parse.quote(target, safe="")}'
+    )
+
+  def is_available(self) -> bool:
+    return self.binary is not None
+
+  def send(
+      self,
+      message: str,
+      *,
+      urgency: str = NORMAL,
+      category: str = '',
+      expire: int = 2000,
+      now: Optional[datetime.datetime] = None,
+  ) -> None:
+    del expire, now
+    if urgency not in {NORMAL, CRITICAL} or not self.binary:
+      return
+    if urgency == CRITICAL or category == 'failed':
+      severity = 'red'
+    elif message.startswith('KILLED:'):
+      severity = 'yellow'
+    else:
+      severity = 'green'
+
+    self._spawn([
+        self.binary,
+        f'--summary={self.summary}',
+        f'--message={message}',
+        f'--uri={self.uri}',
+        f'--severity={severity}',
+    ])
+
+
+NOTIFIERS: dict[str, type[Notifier]] = {
+    TmuxNotifier.name: TmuxNotifier,
+    XtermNotifier.name: XtermNotifier,
+    NotifySendNotifier.name: NotifySendNotifier,
+    NotifySelfNotifier.name: NotifySelfNotifier,
+}
+DEFAULT_NOTIFICATIONS = ','.join(NOTIFIERS.keys())
+
+
+def parse_notification_names(raw: str) -> list[str]:
+  """Parses a comma-separated list of notification method names."""
+  names: list[str] = []
+  for part in raw.split(','):
+    name = part.strip().lower().replace('_', '-')
+    if not name or name == 'none':
+      continue
+    names.append(name)
+  return names
+
+
+def init_notifications(args: argparse.Namespace) -> list[Notifier]:
+  """Instantiates available notification backends configured in args."""
+  notifications: list[Notifier] = []
+  seen: set[str] = set()
+  for name in parse_notification_names(args.notifications):
+    if name in seen:
+      continue
+    seen.add(name)
+    notifier = NOTIFIERS[name](args)
+    if notifier.is_available():
+      logging.debug('Enabled notification method: %s', name)
+      notifications.append(notifier)
+    else:
+      logging.debug('Notification method unavailable: %s', name)
+  return notifications
 
 
 def define_flags() -> argparse.Namespace:
@@ -47,6 +285,19 @@ def define_flags() -> argparse.Namespace:
       action='store_true',
       default=False,
       help="if the machine is headless then notify-send isn't used",
+  )
+  parser.add_argument(
+      '-n',
+      '--notifications',
+      action='store',
+      default=DEFAULT_NOTIFICATIONS,
+      type=str,
+      help=(
+          'comma-separated list of downstream notification methods '
+          f'(choices: {", ".join(NOTIFIERS.keys())}, none; '
+          'default: %(default)s)'
+      ),
+      metavar='METHODS',
   )
   parser.add_argument(
       '--polling-interval',
@@ -88,147 +339,46 @@ def check_flags(
   # See: http://docs.python.org/3/library/argparse.html#exiting-methods
   if not args.socket:
     parser.error('--socket file required')
-
-
-CMD = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-
-NORMAL = 'normal'
-LOW = 'low'
-CRITICAL = 'critical'
-
-
-class Notification(object):
-
-  def __init__(self, message, urgency, category, expire, t):
-    self.message = message
-    self.urgency = urgency
-    self.category = category
-    self.expire = expire
-    self.time = t
-
-  def send(self, args: argparse.Namespace) -> None:
-    """Send notifications in the most visible way."""
-    if os.getenv('TMUX'):
-      if self.urgency in {CRITICAL}:
-        subprocess.call(['tmux', 'display-message', ' ' + self.message])
-    elif os.getenv('TERM', '').startswith('xterm'):
-      sys.stdout.write(
-          '\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
-              time=self.time.strftime('%H:%M:%S'),
-              cmd=CMD,
-              message=self.message,
-          )
-      )
-    if not args.headless:
-      if self.urgency in {NORMAL, CRITICAL}:
-        # Use Popen to not wait for it
-        subprocess.call([
-            'notify-send',
-            '-u',
-            self.urgency,
-            '-c',
-            self.category,
-            '-t',
-            str(self.expire),
-            'efifo: %s' % self.message,
-        ])
-
-
-class NotificationManager(object):
-  """Manages notifications."""
-
-  args: argparse.Namespace
-  t: threading.Thread
-  interrupt: threading.Event
-  shutdown: threading.Event
-  queue: queue.Queue[Notification]
-
-  def __init__(self, args: argparse.Namespace):
-    self.args = args
-    self.t = threading.Thread(target=self.dequeue)
-    self.interrupt = threading.Event()
-    self.shutdown = threading.Event()
-    self.queue = queue.Queue()
-
-  def start(self):
-    self.t.start()
-
-  def enqueue(
-      self,
-      msg: str,
-      *format_args: Any,
-      urgency: str = NORMAL,
-      category: str = '',
-      expire: int = 2000,
-  ) -> None:
-    self.queue.put(
-        Notification(
-            message=msg % format_args,
-            urgency=urgency,
-            category=category,
-            expire=expire,
-            t=datetime.datetime.now(),
-        )
+  unknown = [
+      name
+      for name in parse_notification_names(args.notifications)
+      if name not in NOTIFIERS
+  ]
+  if unknown:
+    parser.error(
+        f'unknown notification method(s): {", ".join(unknown)} '
+        f'(choose from {", ".join(NOTIFIERS.keys())}, none)'
     )
-
-  def dequeue(self):
-    while not self.shutdown.is_set():
-      try:
-        n = queue.get(timeout=self.args.polling_interval)
-        send_notification(
-            self.args,
-            n.message,
-            urgency=n.urgency,
-            category=n.category,
-            expire=n.expire,
-        )
-      except queue.Empty:
-        pass
 
 
 def send_notification(
-    args: argparse.Namespace,
+    notifications: Sequence[Notifier],
     msg: str,
     *format_args: Any,
     urgency: str = NORMAL,
     category: str = '',
     expire: int = 2000,
 ) -> None:
-  """Send notifications in the most visible way.
+  """Send notifications across all active notification methods.
 
   Args:
-    args: Main program args.
+    notifications: Enabled Notifier instances.
     msg: The message to show.
-    *format_args: Extra string formatting files for msg.
+    *format_args: Extra string formatting args for msg.
     urgency: One of NORMAL, LOW or CRITICAL.
     category: A category for this notification.
-    expire: Number of seconds to expire.
+    expire: Number of milliseconds to expire.
   """
   now = datetime.datetime.now()
-  if os.getenv('TMUX'):
-    if urgency in {CRITICAL}:
-      subprocess.call(['tmux', 'display-message', ' ' + msg % format_args])
-  elif os.getenv('TERM', '').startswith('xterm'):
-    sys.stdout.write(
-        '\x1B]0;[{time}] {cmd}: {message}\x07\n'.format(
-            time=now.strftime('%H:%M:%S'),
-            cmd=CMD,
-            message=msg % format_args,
-        )
+  message = msg % format_args if format_args else msg
+  for n in notifications:
+    n.send(
+        message,
+        urgency=urgency,
+        category=category,
+        expire=expire,
+        now=now,
     )
-  if not args.headless:
-    if urgency in {NORMAL, CRITICAL}:
-      # Use Popen to not wait for it
-      subprocess.Popen([
-          'notify-send',
-          '-u',
-          urgency,
-          '-c',
-          category,
-          '-t',
-          str(expire),
-          'efifo: %s' % (msg % format_args),
-      ])
 
 
 def rename_tab(msg: str, *args: Any) -> None:
@@ -280,6 +430,7 @@ last_script: Optional[str] = None
 
 def execute_bash(
     args: argparse.Namespace,
+    notifications: Sequence[Notifier],
     script: str,
     interrupt: Optional[threading.Event] = None,
 ) -> Optional[int]:
@@ -287,6 +438,7 @@ def execute_bash(
 
   Args:
     args: Main program args.
+    notifications: Enabled Notifier instances.
     script: Script to execute through `bash -x`.
     interrupt: When set, kill any running process.
 
@@ -296,7 +448,9 @@ def execute_bash(
   global executions
   executions += 1
   display = display_commands(script)
-  send_notification(args, 'Running: %s [%d]', display, executions, urgency=LOW)
+  send_notification(
+      notifications, 'Running: %s [%d]', display, executions, urgency=LOW
+  )
   cmd = os.path.basename(first_command(script))
   rename_tab('%s..' % cmd)
   start = time.time()
@@ -311,7 +465,7 @@ def execute_bash(
         proc.killed = True
         return
       send_notification(
-          args,
+          notifications,
           'Running: %s %ds [%d]',
           display,
           time.time() - start,
@@ -330,7 +484,7 @@ def execute_bash(
   if proc.killed:
     rename_tab(cmd)
     send_notification(
-        args,
+        notifications,
         'KILLED: %s %0.2fs',
         display,
         elapsed,
@@ -343,7 +497,7 @@ def execute_bash(
   if p.returncode == 0:
     rename_tab(cmd)
     send_notification(
-        args,
+        notifications,
         'DONE: %s [%d] %0.2fs',
         display,
         p.returncode,
@@ -355,7 +509,7 @@ def execute_bash(
   else:
     rename_tab('%s!' % cmd)
     send_notification(
-        args,
+        notifications,
         'FAILED: %s [%d] %0.2fs',
         display,
         p.returncode,
@@ -409,6 +563,7 @@ def serve(
 
 def dequeue(
     args: argparse.Namespace,
+    notifications: Sequence[Notifier],
     scripts: queue.Queue[str],
     interrupt: threading.Event,
     shutdown: threading.Event,
@@ -418,6 +573,7 @@ def dequeue(
 
   Args:
     args: Main program args.
+    notifications: Enabled Notifier instances.
     scripts: The scripts queue.
     interrupt: When set, kill any running process.
     shutdown: When set, shutdown this thread.
@@ -428,7 +584,9 @@ def dequeue(
     try:
       script = scripts.get(timeout=args.polling_interval)
       last_script = script
-      retcode = execute_bash(args, script, interrupt=interrupt)
+      retcode = execute_bash(
+          args, notifications, script, interrupt=interrupt
+      )
       callback(retcode)
     except queue.Empty:
       pass
@@ -462,7 +620,8 @@ def main(args: argparse.Namespace) -> int:
     if not os.path.isdir(dirname):
       os.makedirs(dirname, 0o770)
 
-  send_notification(args, 'Waiting', category='waiting', urgency=LOW)
+  notifications = init_notifications(args)
+  send_notification(notifications, 'Waiting', category='waiting', urgency=LOW)
   rename_tab('x')
 
   sel.register(sys.stdin, selectors.EVENT_READ, data=None)
@@ -497,6 +656,7 @@ def main(args: argparse.Namespace) -> int:
       target=dequeue,
       args=(
           args,
+          notifications,
           scripts,
           interrupt,
           shutdown,
@@ -525,7 +685,10 @@ def main(args: argparse.Namespace) -> int:
 
       except KeyboardInterrupt:
         send_notification(
-            args, 'Keyboard Interrupt', category='interrupt', urgency=LOW
+            notifications,
+            'Keyboard Interrupt',
+            category='interrupt',
+            urgency=LOW,
         )
         if args.reset_and_clear:
           subprocess.call(['reset'])
